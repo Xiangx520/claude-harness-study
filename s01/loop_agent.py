@@ -49,9 +49,15 @@ ENVIRONMENT_PROMPT = (
 # 拿到系统环境拼进提示词
 SYSTEM = (
     f"You are a coding agent at {WORKDIR}. Environment: {ENVIRONMENT_PROMPT}. "
-    "Before starting any multi-step task, use todo_write to plan your steps. "
-    "Update status as you go."
+    "Use task for focused exploration or a self-contained subtask."
 )
+# 子agent提示词
+SUB_SYSTEM = (
+    f"You are a coding agent at {WORKDIR}. Environment: {ENVIRONMENT_PROMPT}. "
+    "Complete the given task, then return a concise final answer."
+)
+
+
 
 
 
@@ -142,6 +148,7 @@ class TodoManager:
 
     # 解析并验证todolist
     def update(self, todos: list | str) -> str:
+
         # 把llm输出的字符串转成json
         if isinstance(todos, str):
             try:
@@ -159,6 +166,7 @@ class TodoManager:
 
         validated = []
         in_progress_count = 0
+        # 这里主要是二次过滤 确保todolist中content和status有效
         for index, todo in enumerate(todos):
             if not isinstance(todo, dict):
                 raise ValueError(f"todos[{index}] must be an object")
@@ -188,6 +196,7 @@ class TodoManager:
 
         lines = []
         for todo in self.items:
+            # 把英文的状态转成符号
             marker = {
                 "pending": "[ ]",
                 "in_progress": "[>]",
@@ -219,7 +228,7 @@ def run_todo_write(todos: list | str) -> str:
 
 #------------------------------------------- tool definitions -------------------------------------------#
 
-TOOLS = [
+BASE_TOOLS = [
     {
         "name": "bash",                                     # 工具名
         "description": "Run a shell command.",              # 描述 交给llm判断是否调用tool_block
@@ -264,10 +273,12 @@ TOOLS = [
 
 
 # 工具注册给dispatch map 用于分发任务
-TOOL_HANDLERS = {
-    "bash": run_bash, "read_file": run_read,
-    "write_file": run_write, "edit_file": run_edit,
-    "glob": run_glob, "todo_write": run_todo_write
+BASE_HANDLERS = {
+    "bash": run_bash,
+    "read_file": run_read,
+    "write_file": run_write,
+    "edit_file": run_edit,
+    "glob": run_glob
 }
 
 
@@ -383,12 +394,115 @@ register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", summary_hook)
 
 
+# 独立封装了llm调用工具的过程 包含前后的钩子
+def execute_tool(block, handlers: dict) -> str:
+    blocked = trigger_hooks("PreToolUse", block)
+    if blocked:
+        return str(blocked)
+
+    handler = handlers.get(block.name)
+    try:
+        output = handler(**block.input) if handler else f"Unknown: {block.name}"
+    except Exception as e:
+        output = f"Error: {e}"
+
+    trigger_hooks("PostToolUse", block, output)
+    return str(output)
 
 
 
 
 
-#------------------------------------------- agent loop -------------------------------------------#
+
+
+#------------------------------------------- nested agent system -------------------------------------------#
+
+
+# 与父agent共享基础工具集和分发器
+SUB_TOOLS = list(BASE_TOOLS)
+SUB_HANDLERS = dict(BASE_HANDLERS)
+
+
+# 用于提取子agent返回的结果
+def extract_text(content) -> str:
+    # 如果不是列表 直接转成str
+    if not isinstance(content, list):
+        return str(content)
+    return "\n".join(
+        getattr(block, "text", "")
+        for block in content
+        if getattr(block, "type", None) == "text"       # 只提取文本内容 如tool_use，tool_res就会被过滤
+    )
+
+# nested agent loop
+def run_subagent(prompt: str) -> str:
+    print("\n\033[35m[Subagent started]\033[0m")
+    messages = [{"role": "user", "content": prompt}]
+
+    # 最多只让子agent循环30次 避免死转
+    for _ in range(30):
+        response = client.messages.create(
+            model=MODEL,
+            system=SUB_SYSTEM,
+            messages=messages,
+            tools=SUB_TOOLS,
+            max_tokens=8000,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+
+        tool_calls = [
+            block for block in response.content if block.type == "tool_use"
+        ]
+        # 循环出口
+        if not tool_calls:
+            force = trigger_hooks("Stop", messages)
+            if force:
+                messages.append({"role": "user", "content": force})
+                continue
+            print("\033[35m[Subagent done]\033[0m")
+            return extract_text(response.content) or "(no summary)"
+
+        results = []
+        for block in tool_calls:
+            output = execute_tool(block, SUB_HANDLERS)
+            print(f"  \033[90m[sub] {block.name}: {output[:100]}\033[0m")
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": output,
+            })
+        messages.append({"role": "user", "content": results})
+
+    print("\033[35m[Subagent stopped]\033[0m")
+    return "Subagent stopped after 30 turns without a final answer."
+
+
+
+
+
+
+
+
+#------------------------------------------- parent agent loop -------------------------------------------#
+
+
+# 把子agent调用封装成tool 可能是因为避免和子agent共享工具集，保证是单嵌套系统
+
+TASK_TOOL = {
+    "name": "task",
+    "description": "Run a subagent with fresh conversation context and return its final text.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"prompt": {"type": "string", "minLength": 1}},
+        "required": ["prompt"],
+    },
+}
+
+TOOLS = [*BASE_TOOLS, TASK_TOOL]
+TOOL_HANDLERS = {**BASE_HANDLERS, "task": run_subagent}
+
+
+
 
 
 # -- The core pattern: a while loop that calls tools until the model stops --
@@ -398,8 +512,11 @@ def agent_loop(messages: list):
 
     while True:
         response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+            model=MODEL,
+            system=SYSTEM,
+            messages=messages,
+            tools=TOOLS,
+            max_tokens=8000,
         )
 
         # Append assistant turn
@@ -432,37 +549,13 @@ def agent_loop(messages: list):
 
         # Execute each tool call, collect results
         results = []
-        used_todo = False
         for block in tool_calls:
-
-            blocked = trigger_hooks("PreToolUse", block)
-            # 如果被阻止了，跳过工具调用
-            if blocked:
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": str(blocked)})
-                continue
-
-            # 多任务采用tools_handlers来分发任务
-            handler = TOOL_HANDLERS.get(block.name)
-            try:
-                output = handler(**block.input) if handler else f"Unknown: {block.name}"
-            except Exception as e:
-                output = f"Error: {e}"
-
-            trigger_hooks("PostToolUse", block, output)
-
-            if block.name == "todo_write":
-                used_todo = True
-
-            results.append({"type": "tool_result", "tool_use_id": block.id,
-                            "content": str(output)})
-
-        round_since_todo = 0 if used_todo else round_since_todo + 1
-        if round_since_todo >= 3:
-            results.append({"type": "text",
-                            "text":  "<reminder>Update your todos.</reminder>"})
-            round_since_todo = 0
-
+            output = execute_tool(block, TOOL_HANDLERS)
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": str(output)
+            })
         # Feed tool results back, loop continues
         messages.append({"role": "user", "content": results})
 
@@ -476,7 +569,7 @@ def agent_loop(messages: list):
 
 # -- Entry point --
 if __name__ == "__main__":
-    print("s05: TodoWrite - plan before execution")
+    print("s06: Subagent - fresh messages, final text returns")
     print("Enter a question, press Enter to send. Type q to quit.\n")
 
     history = []
