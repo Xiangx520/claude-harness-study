@@ -1,6 +1,9 @@
+import ast
+import json
 import os
 import re
 import subprocess
+from pathlib import Path
 
 try:
     import readline
@@ -45,8 +48,9 @@ ENVIRONMENT_PROMPT = (
 )
 # 拿到系统环境拼进提示词
 SYSTEM = (
-    f"You are a coding agent at {os.getcwd()}. Environment: {ENVIRONMENT_PROMPT}. "
-    "Use bash to solve tasks. Act, don't explain."
+    f"You are a coding agent at {WORKDIR}. Environment: {ENVIRONMENT_PROMPT}. "
+    "Before starting any multi-step task, use todo_write to plan your steps. "
+    "Update status as you go."
 )
 
 
@@ -131,6 +135,85 @@ def run_glob(pattern: str) -> str:
         return f"Error: {e}"
 
 
+# todolist 封装工具
+class TodoManager:
+    def __init__(self):
+        self.items: list[dict] = []
+
+    # 解析并验证todolist
+    def update(self, todos: list | str) -> str:
+        # 把llm输出的字符串转成json
+        if isinstance(todos, str):
+            try:
+                todos = json.loads(todos)
+            except json.JSONDecodeError:
+                try:
+                    todos = ast.literal_eval(todos)
+                except (SyntaxError, ValueError) as e:
+                    raise ValueError("todos must be a list or JSON array string") from e
+
+        if not isinstance(todos, list):
+            raise ValueError("todos must be a list")
+        if len(todos) > 20:
+            raise ValueError("Max 20 todos allowed")
+
+        validated = []
+        in_progress_count = 0
+        for index, todo in enumerate(todos):
+            if not isinstance(todo, dict):
+                raise ValueError(f"todos[{index}] must be an object")
+
+            content = str(todo.get("content", "")).strip()
+            status = str(todo.get("status", "pending")).lower()
+            if not content:
+                raise ValueError(f"todos[{index}] requires content")
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"todos[{index}] has invalid status '{status}'")
+            if status == "in_progress":
+                in_progress_count += 1
+            validated.append({"content": content, "status": status})
+
+        if in_progress_count > 1:
+            raise ValueError("Only one todo can be in_progress at a time")
+
+        # 把解析后的任务存储到items
+        self.items = validated
+        return self.render()
+
+
+    # 就是一个显示器 把todolist拼成一个好看的字符串
+    def render(self) -> str:
+        if not self.items:
+            return "No todos."
+
+        lines = []
+        for todo in self.items:
+            marker = {
+                "pending": "[ ]",
+                "in_progress": "[>]",
+                "completed": "[x]",
+            }[todo["status"]]
+            lines.append(f"{marker} {todo['content']}")
+
+        done = sum(todo["status"] == "completed" for todo in self.items)
+        lines.append(f"\n({done}/{len(self.items)} completed)")
+        return "\n".join(lines)
+
+
+TODO = TodoManager()
+
+
+def run_todo_write(todos: list | str) -> str:
+    try:
+        output = TODO.update(todos)
+    except ValueError as e:
+        return f"Error: {e}"
+    print(f"\n\033[33m## Current Tasks\033[0m\n{output}")
+    return output
+
+
+
+
 
 
 
@@ -140,7 +223,7 @@ TOOLS = [
     {
         "name": "bash",                                     # 工具名
         "description": "Run a shell command.",              # 描述 交给llm判断是否调用tool_block
-        "input_schema": {                                   # 参数 json格式 需要llm按参数要求call tools
+        "input_schema": {                                   # 参数 json格式 需要llm按要求传递参数
             "type": "object",                               # 参数整体是一个对象 即dict
             "properties": {"command": {"type": "string"}},  # 对象的属性 一个名为command的str
             "required": ["command"],                        # 必要性检查
@@ -159,16 +242,32 @@ TOOLS = [
     {   "name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
         "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}},
                       "required": ["pattern"]}},
+    {
+        "name": "todo_write", "description": "Create and manage a task list for your current coding session.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "status": {"type": "string", "enums": ["pending", "in_progress", "completed"]},
+                        }
+                    }
+                }
+            }
+        }
+    }
 ]
 
 
 # 工具注册给dispatch map 用于分发任务
 TOOL_HANDLERS = {
-    "bash": run_bash,
-    "read_file": run_read,
-    "write_file": run_write,
-    "edit_file": run_edit,
-    "glob": run_glob,
+    "bash": run_bash, "read_file": run_read,
+    "write_file": run_write, "edit_file": run_edit,
+    "glob": run_glob, "todo_write": run_todo_write
 }
 
 
@@ -192,11 +291,11 @@ HOOKS = {
 def register_hook(event: str, callback):
     HOOKS[event].append(callback)
 
-# 挂载钩子到循环中
+# 钩子触发器
 def trigger_hooks(event: str, *args):
     for callback in HOOKS[event]:
         result = callback(*args)
-        if result is not None:  # A hook result blocks this tool call.
+        if result is not None:  # 如果返回值不为空，hook说停
             return result
     return None
 
@@ -212,6 +311,7 @@ def contains_destructive_command(command: str) -> bool:
     return bool(DESTRUCTIVE_COMMAND_WORD.search(command))
 
 
+# 检查权限
 def permission_hook(block):
     """PreToolUse"""
     if block.name == "bash":
@@ -251,6 +351,7 @@ def log_hook(block):
     return None
 
 
+# 大输出
 def large_output_hook(block, output):
     """PostToolUse: warn on large output."""
     if len(str(output)) > 100000:
@@ -292,6 +393,9 @@ register_hook("Stop", summary_hook)
 
 # -- The core pattern: a while loop that calls tools until the model stops --
 def agent_loop(messages: list):
+
+    round_since_todo = 0
+
     while True:
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
@@ -306,6 +410,10 @@ def agent_loop(messages: list):
             block for block in response.content if block.type == "tool_use"
         ]
         if not tool_calls:
+            force = trigger_hooks("Stop", messages)
+            if force:
+                messages.append({"role": "user", "content": force})
+                continue
             return
 
         """
@@ -316,15 +424,19 @@ def agent_loop(messages: list):
           "name": "bash",
           "input": {
             "command": "dir"  --> 实际的command命令
+            "xxx": "xxx"
+            ...
           }
         }
         """
 
         # Execute each tool call, collect results
         results = []
+        used_todo = False
         for block in tool_calls:
 
             blocked = trigger_hooks("PreToolUse", block)
+            # 如果被阻止了，跳过工具调用
             if blocked:
                 results.append({"type": "tool_result", "tool_use_id": block.id,
                                 "content": str(blocked)})
@@ -332,15 +444,24 @@ def agent_loop(messages: list):
 
             # 多任务采用tools_handlers来分发任务
             handler = TOOL_HANDLERS.get(block.name)
-            output = handler(**block.input) if handler else f"Unknown: {block.name}"
+            try:
+                output = handler(**block.input) if handler else f"Unknown: {block.name}"
+            except Exception as e:
+                output = f"Error: {e}"
 
             trigger_hooks("PostToolUse", block, output)
 
-            results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": output,
-            })
+            if block.name == "todo_write":
+                used_todo = True
+
+            results.append({"type": "tool_result", "tool_use_id": block.id,
+                            "content": str(output)})
+
+        round_since_todo = 0 if used_todo else round_since_todo + 1
+        if round_since_todo >= 3:
+            results.append({"type": "text",
+                            "text":  "<reminder>Update your todos.</reminder>"})
+            round_since_todo = 0
 
         # Feed tool results back, loop continues
         messages.append({"role": "user", "content": results})
@@ -355,7 +476,7 @@ def agent_loop(messages: list):
 
 # -- Entry point --
 if __name__ == "__main__":
-    print("s04: Hooks - extension logic on hooks, loop stays clean")
+    print("s05: TodoWrite - plan before execution")
     print("Enter a question, press Enter to send. Type q to quit.\n")
 
     history = []
@@ -367,12 +488,13 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+
+        trigger_hooks("UserPromptSubmit", query)
+
         history.append({"role": "user", "content": query})
         agent_loop(history)
         # Print the model's final text response
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if getattr(block, "type", None) == "text":
-                    print(block.text)
+        for block in history[-1]["content"]:
+            if getattr(block, "type", None) == "text":
+                print(block.text)
         print()
