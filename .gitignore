@@ -1,0 +1,13 @@
+# Local credentials (only the blank example is versioned)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local Python and editor files
+.venv/
+__pycache__/
+*.py[cod]
+.idea/
+.pytest_cache/
