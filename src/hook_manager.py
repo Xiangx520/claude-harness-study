@@ -90,18 +90,3 @@ class HookManager:
         )
         print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
         return None
-
-    def execute_tool(self, block, handlers: dict) -> str:
-        """Execute a tool between the PreToolUse and PostToolUse hooks."""
-        blocked = self.trigger_hooks("PreToolUse", block)
-        if blocked:
-            return str(blocked)
-
-        handler = handlers.get(block.name)
-        try:
-            output = handler(**block.input) if handler else f"Unknown: {block.name}"
-        except Exception as e:
-            output = f"Error: {e}"
-
-        self.trigger_hooks("PostToolUse", block, output)
-        return str(output)

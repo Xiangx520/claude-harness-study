@@ -1,0 +1,3 @@
+- [indentation_preference](indentation_preference.md) - User prefers tabs for indentation in code
+- [python_file_creation_preference](python_file_creation_preference.md) - User is studying Python and wants Python used for file creation
+- [user_name](user_name.md) - User's name
