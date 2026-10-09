@@ -57,7 +57,7 @@ class ContextCompactor:
                         for block in content)
         )
 
-    # 在触发上下文压缩时 保留还没有交给llm的工具返回结果的位置 防止被压缩
+    # 找出最后一条模型回复之后新增的工具结果，返回它们在聊天记录中的位置。
     @staticmethod
     def unseen_tool_result_positions(messages: list) -> set[tuple[int, int]]:
         """Return results added since the model's most recent response."""
@@ -158,9 +158,11 @@ class ContextCompactor:
     def tool_result_budget(self, messages: list, max_chars: int | None = None) -> list:
         if not messages:
             return messages
+        # 传入的msg是一整个history 该方法只取最新的一条content
         content = messages[-1].get("content")
         if messages[-1].get("role") != "user" or not isinstance(content, list):
             return messages
+        # 筛选工具调用结果
         blocks = [block for block in content
                   if isinstance(block, dict) and block.get("type") == "tool_result"]
         limit = max_chars or self.TOOL_RESULT_BATCH_CHAR_LIMIT

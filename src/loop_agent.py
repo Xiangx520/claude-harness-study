@@ -1,7 +1,5 @@
-import json
 import os
 import subprocess
-import ast
 
 # 优化命令行交互效果
 try:
@@ -22,6 +20,7 @@ from pathlib import Path
 from context_compactor import ContextCompactor
 from skill_loader import SkillLoader
 from hook_manager import HookManager
+from todo_manager import TodoManager
 
 
 load_dotenv(override=True)
@@ -118,7 +117,7 @@ def run_bash(command: str) -> str:
     except (FileNotFoundError, OSError) as e:
         return f"Error: {e}"
 
-# 拿到工作目录内的一个目录位置
+# 检查操作的位置是否在工作目录内
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     # 如果该目录在工作目录以外 报错
@@ -174,78 +173,8 @@ def run_glob(pattern: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-
-# todolist 封装工具
-class TodoManager:
-    def __init__(self):
-        self.items: list[dict] = []
-
-    # 解析并验证todolist
-    def update(self, todos: list | str) -> str:
-
-        # 把llm输出的字符串转成json
-        if isinstance(todos, str):
-            try:
-                todos = json.loads(todos)
-            except json.JSONDecodeError:
-                try:
-                    todos = ast.literal_eval(todos)
-                except (SyntaxError, ValueError) as e:
-                    raise ValueError("todos must be a list or JSON array string") from e
-
-        if not isinstance(todos, list):
-            raise ValueError("todos must be a list")
-        if len(todos) > 20:
-            raise ValueError("Max 20 todos allowed")
-
-        validated = []
-        in_progress_count = 0
-        # 这里主要是二次过滤 确保todolist中content和status有效
-        for index, todo in enumerate(todos):
-            if not isinstance(todo, dict):
-                raise ValueError(f"todos[{index}] must be an object")
-
-            content = str(todo.get("content", "")).strip()
-            status = str(todo.get("status", "pending")).lower()
-            if not content:
-                raise ValueError(f"todos[{index}] requires content")
-            if status not in ("pending", "in_progress", "completed"):
-                raise ValueError(f"todos[{index}] has invalid status '{status}'")
-            if status == "in_progress":
-                in_progress_count += 1
-            validated.append({"content": content, "status": status})
-
-        if in_progress_count > 1:
-            raise ValueError("Only one todo can be in_progress at a time")
-
-        # 把解析后的任务存储到items
-        self.items = validated
-        return self.render()
-
-
-    # 就是一个显示器 把todolist拼成一个好看的字符串
-    def render(self) -> str:
-        if not self.items:
-            return "No todos."
-
-        lines = []
-        for todo in self.items:
-            # 把英文的状态转成符号
-            marker = {
-                "pending": "[ ]",
-                "in_progress": "[>]",
-                "completed": "[x]",
-            }[todo["status"]]
-            lines.append(f"{marker} {todo['content']}")
-
-        done = sum(todo["status"] == "completed" for todo in self.items)
-        lines.append(f"\n({done}/{len(self.items)} completed)")
-        return "\n".join(lines)
-
-
+# 任务列表管理
 TODO = TodoManager()
-
-
 def run_todo_write(todos: list | str) -> str:
     try:
         output = TODO.update(todos)
@@ -262,7 +191,7 @@ def run_todo_write(todos: list | str) -> str:
 
 #------------------------------------------- tool definitions -------------------------------------------#
 
-# 基础工具 包括bash操作 文件的增删改查
+# 工具定义告诉模型可用能力；基础工具仅包括命令执行和文件操作
 BASE_TOOLS = [
     {
         "name": "bash",                                     # 工具名
@@ -288,41 +217,44 @@ BASE_TOOLS = [
                       "required": ["pattern"]}},
 ]
 
-
+# 分发器将工具名映射到 Python 函数，与 BASE_TOOLS 一一对应
+BASE_HANDLERS = {
+    "bash": run_bash,
+    "read_file": run_read,
+    "write_file": run_write,
+    "edit_file": run_edit,
+    "glob": run_glob,
+}
 
 # skill加载工具
-SKILL_TOOL = [
-    {   "name": "load_skill", "description": "Load the full SKILL.md content by skill name.",
-        "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}},
-                        "required": ["name"]},
-]
+SKILL_TOOL = {
+    "name": "load_skill",
+    "description": "Load the full SKILL.md content by skill name.",
+    "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}},
+    "required": ["name"],
+}
 
-
-
-# 任务拆分工具
-TODO_TOOL = [
-    {
-        "name": "todo_write", "description": "Create and manage a task list for your current coding session.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "todos": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "content": {"type": "string"},
-                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
-                        }
+# 主 agent 的任务列表工具
+TODO_TOOL = {
+    "name": "todo_write", "description": "Create and manage a task list for your current coding session.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "todos": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string"},
+                        "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
                     }
                 }
             }
         }
-    },
-]
+    }
+}
 
-
-# 子agent调用工具
+# 分发任务给子agent
 TASK_TOOL = {
     "name": "task",
     "description": "Run a subagent with fresh conversation context and return its final text.",
@@ -333,26 +265,11 @@ TASK_TOOL = {
     },
 }
 
-
 # 上下文压缩工具
 COMPACT_TOOL = {
     "name": "compact",
     "description": "Summarize earlier conversation to free context space.",
     "input_schema": {"type": "object", "properties": {}},
-}
-
-
-
-# 工具注册给dispatch map 用于分发任务
-BASE_HANDLERS = {
-    "bash": run_bash,
-    "read_file": run_read,
-    "write_file": run_write,
-    "edit_file": run_edit,
-    "glob": run_glob,
-    "load_skill": SKILL_LOADER.load,
-    "todo_write": run_todo_write,
-    "compact": "",
 }
 
 
@@ -364,7 +281,7 @@ BASE_HANDLERS = {
 #------------------------------------------- nested agent system -------------------------------------------#
 
 
-# 与父agent共享基础工具集和分发器
+# 子 agent 仅使用基础能力，复制容器以便独立组装
 SUB_TOOLS = list(BASE_TOOLS)
 SUB_HANDLERS = dict(BASE_HANDLERS)
 
@@ -432,10 +349,16 @@ def run_subagent(prompt: str) -> str:
 #------------------------------------------- parent agent loop -------------------------------------------#
 
 
-# 单独给父agent注册的工具
+# 主 agent 的完整工具定义：基础能力加 skill、todolist、task、compact。
+MAIN_TOOLS = [*BASE_TOOLS, SKILL_TOOL, TODO_TOOL, TASK_TOOL, COMPACT_TOOL]
 
-TOOLS = [*BASE_TOOLS, TASK_TOOL]
-TOOL_HANDLERS = {**BASE_HANDLERS, "task": run_subagent}
+# compact 由主循环在工具批次结束后处理，不进入普通分发器。
+MAIN_HANDLERS = {
+    **BASE_HANDLERS,
+    "load_skill": SKILL_LOADER.load,
+    "todo_write": run_todo_write,
+    "task": run_subagent,
+}
 
 
 
@@ -449,7 +372,7 @@ def agent_loop(messages: list, active_request: str):
         try:
             response = client.messages.create(
                 model=MODEL, system=SYSTEM, messages=messages,
-                tools=TOOLS, max_tokens=8000,
+                tools=MAIN_TOOLS, max_tokens=8000,
             )
             reactive_retries = 0
         except Exception as error:
@@ -498,7 +421,7 @@ def agent_loop(messages: list, active_request: str):
                 output = "Compaction requested after this tool batch."
                 compact_requested = True
             else:
-                output = HOOK_MANAGER.execute_tool(block, TOOL_HANDLERS)
+                output = HOOK_MANAGER.execute_tool(block, MAIN_HANDLERS)
                 print(output[:200])
             results.append({"type": "tool_result", "tool_use_id": block.id,
                             "content": output})
@@ -533,7 +456,7 @@ if __name__ == "__main__":
         HOOK_MANAGER.trigger_hooks("UserPromptSubmit", query)
 
         history.append({"role": "user", "content": query})
-        agent_loop(history)
+        agent_loop(history, query)
         # Print the model's final text response
         for block in history[-1]["content"]:
             if getattr(block, "type", None) == "text":
