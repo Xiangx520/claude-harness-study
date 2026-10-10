@@ -22,6 +22,7 @@ from hook_manager import HookManager
 from tool_manager import ToolManager
 from memory_store import MemoryStore
 from task_store import TaskStore
+from background_manager import inject_background_results
 
 
 load_dotenv(override=True)
@@ -90,6 +91,7 @@ def build_system_prompt() -> str:
     return (
         f"You are a coding agent at {WORKDIR}. Environment: {ENVIRONMENT_PROMPT}. "
         "Use tools to solve tasks. "
+        "Set run_in_background to true only for independent Bash commands. "
         "Use task for focused exploration or a self-contained subtask. "
         "Use task tools to track dependencies and progress. Create all task nodes "
         "first. After create_task returns runtime-generated IDs, use update_task "
@@ -183,6 +185,7 @@ def agent_loop(messages: list, active_request: str):
     reactive_retries = 0
     while True:
         messages[:] = COMPACTOR.prepare(messages, active_request)
+        inject_background_results(messages)
         try:
             response = client.messages.create(
                 model=MODEL, system=system, messages=messages,

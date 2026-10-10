@@ -1,10 +1,15 @@
 import json
-import os
-import subprocess
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 
+from background_manager import (
+    _format_bash_result,
+    _run_bash_process,
+    should_run_background,
+    start_background_task,
+)
 from hook_manager import HookManager
 from skill_loader import SkillLoader
 from task_store import TASK_ID_PATTERN, TaskStore
@@ -98,7 +103,12 @@ class ToolManager:
             "edit_file": self.run_edit,
             "glob": self.run_glob,
         }
-        self.main_tools = [*BASE_TOOLS, SKILL_TOOL, *TASK_TOOLS, TASK_TOOL, COMPACT_TOOL]
+        # 仅主 agent 暴露后台参数，不修改子 agent 使用的基础定义。
+        main_base_tools = deepcopy(BASE_TOOLS)
+        main_base_tools[0]["input_schema"]["properties"]["run_in_background"] = {
+            "type": "boolean"
+        }
+        self.main_tools = [*main_base_tools, SKILL_TOOL, *TASK_TOOLS, TASK_TOOL, COMPACT_TOOL]
         # compact 由主循环在工具批次结束后处理，不进入普通分发器。
         self.main_handlers = {
             **self.sub_handlers,
@@ -113,22 +123,12 @@ class ToolManager:
         }
 
     # 执行command并返回结果给调用方
-    def run_bash(self, command: str) -> str:
+    def run_bash(self, command: str, run_in_background: bool = False) -> str:
         dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
         # 危险操作检查
         if any(d in command for d in dangerous):
             return "Error: Dangerous command blocked"
-        try:
-            # 运行bash
-            r = subprocess.run(command, shell=True, cwd=os.getcwd(),
-                               capture_output=True, text=True, errors="replace", timeout=120)
-            # 合并运行结果及报错
-            out = (r.stdout + r.stderr).strip()
-            return out[:50000] if out else "(no output)"
-        except subprocess.TimeoutExpired:
-            return "Error: Timeout (120s)"
-        except (FileNotFoundError, OSError) as e:
-            return f"Error: {e}"
+        return _format_bash_result(*_run_bash_process(command))
 
     # 检查操作的位置是否在工作目录内
     def safe_path(self, p: str) -> Path:
@@ -230,12 +230,25 @@ class ToolManager:
     def execute_tool(self, block, handlers: dict) -> str:
         """Execute a tool between the PreToolUse and PostToolUse hooks."""
         blocked = self.hook_manager.trigger_hooks("PreToolUse", block)
-        if blocked:
+        if blocked is not None:
             return str(blocked)
 
-        handler = handlers.get(block.name)
         try:
-            output = handler(**block.input) if handler else f"Unknown: {block.name}"
+            if handlers is self.main_handlers and should_run_background(block.name, block.input):
+                # 后台分支也保留 run_bash 原有的危险命令检查。
+                dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
+                command = block.input.get("command")
+                if isinstance(command, str) and any(d in command for d in dangerous):
+                    output = "Error: Dangerous command blocked"
+                else:
+                    task_id = start_background_task(block)
+                    output = (
+                        f"[Background task {task_id} started] "
+                        "The result will be collected on a later turn."
+                    )
+            else:
+                handler = handlers.get(block.name)
+                output = handler(**block.input) if handler else f"Unknown: {block.name}"
         except Exception as e:
             output = f"Error: {e}"
 

@@ -4,7 +4,6 @@ import re
 import json
 import secrets
 
-
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
