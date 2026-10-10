@@ -21,6 +21,7 @@ from skill_loader import SkillLoader
 from hook_manager import HookManager
 from tool_manager import ToolManager
 from memory_store import MemoryStore
+from task_store import TaskStore
 
 
 load_dotenv(override=True)
@@ -29,12 +30,19 @@ load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
-# 工作目录
+# 工作根目录
 WORKDIR = Path.cwd()
+# 完整content存储目录
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
+# 跨会话记忆存储目录
 MEMORY_DIR = WORKDIR / ".memory"
+# 跨会话记忆索引
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
+# 工具结果存储目录
 TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
+# 任务存储目录
+TASKS_DIR = WORKDIR / ".tasks"
+# skill存储目录
 SKILLS_DIR = WORKDIR / "skills"
 
 # 加载llm sdk
@@ -52,6 +60,8 @@ COMPACTOR = ContextCompactor(client, MODEL, TRANSCRIPT_DIR, TOOL_RESULTS_DIR)
 MAX_REACTIVE_RETRIES = 1
 # 会话记忆库实例
 MEMORY_STORE = MemoryStore(WORKDIR, MEMORY_DIR, MEMORY_INDEX, client, MODEL)
+# 任务管理器实例
+TASK_STORE = TaskStore(WORKDIR, TASKS_DIR)
 
 
 
@@ -80,7 +90,10 @@ def build_system_prompt() -> str:
     return (
         f"You are a coding agent at {WORKDIR}. Environment: {ENVIRONMENT_PROMPT}. "
         "Use tools to solve tasks. "
-        "Use task for focused exploration or a self-contained subtask."
+        "Use task for focused exploration or a self-contained subtask. "
+        "Use task tools to track dependencies and progress. Create all task nodes "
+        "first. After create_task returns runtime-generated IDs, use update_task "
+        "with those exact IDs to add dependencies. "
         "Act, don't explain.\n\n"
         f"Skills available:\n{SKILL_LOADER.catalog()}\n\n"
         "Use load_skill to read the full instructions when a skill applies."
@@ -159,7 +172,8 @@ def run_subagent(prompt: str) -> str:
 
 
 # 工具管理器通过回调连接子 agent，避免循环导入。
-TOOL_MANAGER = ToolManager(WORKDIR, HOOK_MANAGER, SKILL_LOADER, run_subagent)
+TOOL_MANAGER = ToolManager(WORKDIR, HOOK_MANAGER, SKILL_LOADER, run_subagent,
+                           task_store=TASK_STORE)
 
 
 # -- The core pattern: a while loop that calls tools until the model stops --

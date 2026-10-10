@@ -11,3 +11,6 @@ __pycache__/
 *.py[cod]
 .idea/
 .pytest_cache/
+
+# Persistent local agent tasks
+.tasks/

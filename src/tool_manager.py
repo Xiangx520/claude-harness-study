@@ -1,11 +1,13 @@
+import json
 import os
 import subprocess
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 
 from hook_manager import HookManager
 from skill_loader import SkillLoader
-from todo_manager import TodoManager
+from task_store import TASK_ID_PATTERN, TaskStore
 
 
 # 工具定义告诉模型可用能力；基础工具仅包括命令执行和文件操作
@@ -42,25 +44,21 @@ SKILL_TOOL = {
     "required": ["name"],
 }
 
-# 主 agent 的任务列表工具
-TODO_TOOL = {
-    "name": "todo_write", "description": "Create and manage a task list for your current coding session.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "todos": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "content": {"type": "string"},
-                        "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
-                    }
-                }
-            }
-        }
-    }
-}
+# 主 agent 的持久化任务工具；task 工具仍用于子 agent 委派。
+TASK_TOOLS = [
+    {"name": "create_task", "description": "Create a task and return its runtime-generated ID.",
+     "input_schema": {"type": "object", "properties": {"subject": {"type": "string"}, "description": {"type": "string"}}, "required": ["subject"], "additionalProperties": False}},
+    {"name": "update_task", "description": "Add dependencies using IDs returned by create_task.",
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "string", "pattern": TASK_ID_PATTERN.pattern}, "addBlockedBy": {"type": "array", "items": {"type": "string", "pattern": TASK_ID_PATTERN.pattern}, "minItems": 1}}, "required": ["task_id", "addBlockedBy"], "additionalProperties": False}},
+    {"name": "list_tasks", "description": "List tasks with status, owner, and dependencies.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "get_task", "description": "Get a task by ID.",
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}},
+    {"name": "claim_task", "description": "Claim a pending task whose dependencies are complete.",
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}},
+    {"name": "complete_task", "description": "Complete the task claimed by this agent.",
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}},
+]
 
 # 分发任务给子agent
 TASK_TOOL = {
@@ -85,10 +83,11 @@ class ToolManager:
     """Manage tool definitions, handlers, and execution through agent hooks."""
 
     def __init__(self, workdir: Path, hook_manager: HookManager,
-                 skill_loader: SkillLoader, task_handler: Callable[[str], str]):
+                 skill_loader: SkillLoader, task_handler: Callable[[str], str],
+                 task_store: TaskStore):
         self.workdir = workdir
         self.hook_manager = hook_manager
-        self.todo = TodoManager()
+        self.task_store = task_store
 
         # 子 agent 仅使用基础能力，复制容器以便独立组装。
         self.sub_tools = list(BASE_TOOLS)
@@ -99,12 +98,17 @@ class ToolManager:
             "edit_file": self.run_edit,
             "glob": self.run_glob,
         }
-        self.main_tools = [*BASE_TOOLS, SKILL_TOOL, TODO_TOOL, TASK_TOOL, COMPACT_TOOL]
+        self.main_tools = [*BASE_TOOLS, SKILL_TOOL, *TASK_TOOLS, TASK_TOOL, COMPACT_TOOL]
         # compact 由主循环在工具批次结束后处理，不进入普通分发器。
         self.main_handlers = {
             **self.sub_handlers,
             "load_skill": skill_loader.load,
-            "todo_write": self.run_todo_write,
+            "create_task": self.run_create_task,
+            "update_task": self.run_update_task,
+            "list_tasks": self.run_list_tasks,
+            "get_task": self.run_get_task,
+            "claim_task": self.run_claim_task,
+            "complete_task": self.run_complete_task,
             "task": task_handler,
         }
 
@@ -182,14 +186,46 @@ class ToolManager:
         except Exception as e:
             return f"Error: {e}"
 
-    # 任务列表管理
-    def run_todo_write(self, todos: list | str) -> str:
-        try:
-            output = self.todo.update(todos)
-        except ValueError as e:
-            return f"Error: {e}"
-        print(f"\n\033[33m## Current Tasks\033[0m\n{output}")
-        return output
+    # 任务状态规则交给 TaskStore，这里只处理工具参数及返回文本。
+    def run_create_task(self, subject: str, description: str = "") -> str:
+        task = self.task_store.create(subject, description)
+        print(f"  [create] {task.subject}")
+        return f"Created {task.id}: {task.subject}"
+
+    def run_update_task(self, task_id: str, addBlockedBy: list[str]) -> str:
+        task = self.task_store.update_dependencies(task_id, addBlockedBy)
+        dependencies = ", ".join(task.blockedBy) or "(none)"
+        print(f"  [update] {task.subject} blockedBy: {dependencies}")
+        return f"Updated {task.id} blockedBy: {dependencies}"
+
+    def run_list_tasks(self) -> str:
+        tasks = self.task_store.list()
+        if not tasks:
+            return "No tasks. Use create_task to add some."
+        lines = []
+        for task in tasks:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(task.status, "[?]")
+            dependencies = f" (blockedBy: {', '.join(task.blockedBy)})" if task.blockedBy else ""
+            owner = f" [{task.owner}]" if task.owner else ""
+            lines.append(f"{marker} {task.id}: {task.subject} [{task.status}]{owner}{dependencies}")
+        return "\n".join(lines)
+
+    def run_get_task(self, task_id: str) -> str:
+        return json.dumps(asdict(self.task_store.load(task_id)), indent=2)
+
+    def run_claim_task(self, task_id: str) -> str:
+        task = self.task_store.claim(task_id, owner="agent")
+        print(f"  [claim] {task.subject} -> in_progress (owner: agent)")
+        return f"Claimed {task.id} ({task.subject})"
+
+    def run_complete_task(self, task_id: str) -> str:
+        task, unblocked = self.task_store.complete(task_id, owner="agent")
+        print(f"  [complete] {task.subject}")
+        message = f"Completed {task.id} ({task.subject})"
+        if unblocked:
+            message += f"\nUnblocked: {', '.join(candidate.subject for candidate in unblocked)}"
+            print(f"  [unblocked] {', '.join(candidate.subject for candidate in unblocked)}")
+        return message
 
     def execute_tool(self, block, handlers: dict) -> str:
         """Execute a tool between the PreToolUse and PostToolUse hooks."""
